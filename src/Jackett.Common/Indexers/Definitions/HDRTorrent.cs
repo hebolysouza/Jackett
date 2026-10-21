@@ -100,6 +100,26 @@ namespace Jackett.Common.Indexers.Definitions
             return fileInfo;
         }
 
+        // A single slow or broken detail page must not kill the whole search.
+        // Wait at most DetailTimeout per page and skip that row if it fails or times out.
+        private static readonly TimeSpan DetailTimeout = TimeSpan.FromSeconds(15);
+
+        private string GetDetailPageOrNull(Uri detailUrl)
+        {
+            try
+            {
+                var task = _webclient.GetResultAsync(new WebRequest(detailUrl.ToString()));
+                if (!task.Wait(DetailTimeout))
+                    return null;
+
+                return task.Result?.ContentString;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
         public override IList<ReleaseInfo> ParseResponse(IndexerResponse indexerResponse)
         {
             var releases = new List<ReleaseInfo>();
@@ -128,8 +148,11 @@ namespace Jackett.Common.Indexers.Definitions
                     Seeders = 1
                 };
 
-                var detailsPage = _webclient.GetResultAsync(new WebRequest(detailUrl.ToString())).Result;
-                var detailsDom = parser.ParseDocument(detailsPage.ContentString);
+                var detailsHtml = GetDetailPageOrNull(detailUrl);
+                if (string.IsNullOrEmpty(detailsHtml))
+                    continue;
+
+                var detailsDom = parser.ParseDocument(detailsHtml);
 
                 var fileInfoDict = ExtractFileInfo(detailsDom);
                 var fileInfo = PublicBrazilianIndexerBase.FileInfo.FromDictionary(fileInfoDict);
