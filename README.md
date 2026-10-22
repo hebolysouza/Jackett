@@ -1,6 +1,10 @@
 # Jackett
 
 > **This is an unofficial fork** with the Brazilian indexers ApacheTorrent, RedeTorrent and HDRTorrent fixed. It is not affiliated with the Jackett project and it does not track upstream builds. See **[FORK-BR-INDEXERS.md](FORK-BR-INDEXERS.md)** for what changed, how to install it and how to build it for other Jackett versions. Releases are on the [Releases page](../../releases). The rest of this README is the original Jackett README.
+>
+> [![Latest fork release](https://img.shields.io/github/v/release/hebolysouza/Jackett?style=flat-square&label=latest%20fork%20release&color=16a34a)](../../releases/latest) ![Unofficial fork](https://img.shields.io/badge/status-unofficial%20fork-6b7280?style=flat-square)
+>
+> **Which version does it work with?** Each release is a patched `Jackett.Common.dll` built for **one specific Jackett version**, the one in the release name (for example, `v0.24.2830-br1` is for Jackett 0.24.2830). It does not work with other Jackett versions: build it yourself for those, as described in [FORK-BR-INDEXERS.md](FORK-BR-INDEXERS.md).
 
 [![GitHub issues](https://img.shields.io/github/issues/Jackett/Jackett.svg?maxAge=60&style=flat-square)](https://github.com/Jackett/Jackett/issues)
 [![GitHub pull requests](https://img.shields.io/github/issues-pr/Jackett/Jackett.svg?maxAge=60&style=flat-square)](https://github.com/Jackett/Jackett/pulls)
