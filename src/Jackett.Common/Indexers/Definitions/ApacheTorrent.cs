@@ -1,8 +1,11 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 using AngleSharp.Dom;
 using AngleSharp.Html.Parser;
 using Jackett.Common.Extensions;
@@ -90,24 +93,6 @@ namespace Jackett.Common.Indexers.Definitions
             return ExtractSizeByResolution(t);
         }
 
-        // A post can list several sizes in one field (one per version). ParseUtil.GetBytes would glue
-        // all the digits together and return an absurd number, so read each size separately.
-        private static List<long> ParseSizes(string text)
-        {
-            var sizes = new List<long>();
-            if (string.IsNullOrWhiteSpace(text))
-                return sizes;
-
-            foreach (Match m in Regex.Matches(text, @"(\d+(?:[.,]\d+)?)\s*(TB|GB|MB|KB)", RegexOptions.IgnoreCase))
-            {
-                var bytes = RowParsingExtensions.GetBytes(m.Value);
-                if (bytes > 0 && bytes < 2L * 1024 * 1024 * 1024 * 1024)
-                    sizes.Add(bytes);
-            }
-
-            return sizes;
-        }
-
         private Dictionary<string, string> ExtractFileInfo(IDocument detailsDom)
         {
             var fileInfo = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -143,26 +128,6 @@ namespace Jackett.Common.Indexers.Definitions
             return fileInfo;
         }
 
-        // A single slow or broken detail page must not kill the whole search.
-        // Wait at most DetailTimeout per page and skip that row if it fails or times out.
-        private static readonly TimeSpan DetailTimeout = TimeSpan.FromSeconds(15);
-
-        private string GetDetailPageOrNull(Uri detailUrl)
-        {
-            try
-            {
-                var task = _webclient.GetResultAsync(new WebRequest(detailUrl.ToString()));
-                if (!task.Wait(DetailTimeout))
-                    return null;
-
-                return task.Result?.ContentString;
-            }
-            catch (Exception)
-            {
-                return null;
-            }
-        }
-
         public override IList<ReleaseInfo> ParseResponse(IndexerResponse indexerResponse)
         {
             var releases = new List<ReleaseInfo>();
@@ -171,6 +136,8 @@ namespace Jackett.Common.Indexers.Definitions
             var dom = parser.ParseDocument(indexerResponse.Content);
             var rows = dom.QuerySelectorAll("div.capa-item");
 
+            // First collect every card, then download all detail pages together (see BrazilianDetailPages).
+            var cards = new List<ReleaseInfo>();
             foreach (var row in rows)
             {
                 var detailAnchor = row.QuerySelector("h2.capa-titulo a") ?? row.QuerySelector("a[href^=\"https://\"]");
@@ -181,7 +148,10 @@ namespace Jackett.Common.Indexers.Definitions
                 if (string.IsNullOrEmpty(detailUrlStr))
                     continue;
 
-                var detailUrl = new Uri(detailUrlStr);
+                var detailUrl = BrazilianDetailPages.TryAbsoluteUri(detailUrlStr);
+                if (detailUrl == null)
+                    continue;
+
                 var title = detailAnchor.GetAttribute("title")?.Trim();
                 if (string.IsNullOrEmpty(title))
                     title = detailAnchor.TextContent.Trim();
@@ -193,9 +163,14 @@ namespace Jackett.Common.Indexers.Definitions
                     Guid = detailUrl,
                     Seeders = 1
                 };
+                cards.Add(releaseCommonInfo);
+            }
 
-                var detailsHtml = GetDetailPageOrNull(detailUrl);
-                if (string.IsNullOrEmpty(detailsHtml))
+            var detailPages = BrazilianDetailPages.Fetch(_webclient, cards.Select(c => c.Details).ToList());
+
+            foreach (var releaseCommonInfo in cards)
+            {
+                if (!detailPages.TryGetValue(releaseCommonInfo.Details.AbsoluteUri, out var detailsHtml))
                     continue;
 
                 var detailsDom = parser.ParseDocument(detailsHtml);
@@ -210,7 +185,7 @@ namespace Jackett.Common.Indexers.Definitions
                         : DateTime.Today;
 
                 var magnetLinks = detailsDom.QuerySelectorAll("a[href^='magnet:?']").ToArray();
-                var sizes = ParseSizes(fileInfo.Size);
+                var sizes = BrazilianDetailPages.ParseSizes(fileInfo.Size);
                 for (var idx = 0; idx < magnetLinks.Length; idx++)
                 {
                     var magnetLink = magnetLinks[idx];
@@ -218,8 +193,12 @@ namespace Jackett.Common.Indexers.Definitions
                     if (string.IsNullOrEmpty(magnet))
                         continue;
 
+                    var magnetUri = BrazilianDetailPages.TryAbsoluteUri(magnet);
+                    if (magnetUri == null)
+                        continue;
+
                     var release = releaseCommonInfo.Clone() as ReleaseInfo;
-                    release.Guid = release.MagnetUri = new Uri(magnet);
+                    release.Guid = release.MagnetUri = magnetUri;
                     release.DownloadVolumeFactor = 0;
                     release.UploadVolumeFactor = 1;
 
@@ -258,6 +237,129 @@ namespace Jackett.Common.Indexers.Definitions
             }
 
             return description;
+        }
+    }
+
+    // Shared by ApacheTorrent, RedeTorrent and HDRTorrent (kept in this file so the fork stays three files).
+    public static class BrazilianDetailPages
+    {
+        // Each detail page may take at most PageTimeout; all detail pages of one search together at most
+        // TotalBudget, so the whole search answers before the 100 s limit of Jackett, Prowlarr, Radarr and Sonarr.
+        // Pages that miss either limit are skipped (only that result is lost, not the whole search).
+        public static readonly TimeSpan PageTimeout = TimeSpan.FromSeconds(15);
+        public static readonly TimeSpan TotalBudget = TimeSpan.FromSeconds(70);
+
+        // Up to MaxParallel pages in flight, and new requests start at least MinSpacing apart: a fast site sees
+        // the same request rate as before (the base indexer uses a 0.5 s delay), a slow site no longer adds up
+        // every page one after the other.
+        public const int MaxParallel = 3;
+        public static readonly TimeSpan MinSpacing = TimeSpan.FromMilliseconds(500);
+
+        public static Uri TryAbsoluteUri(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return null;
+
+            // only web pages and magnets: on Linux a bare "/path" would otherwise become a file:// URI
+            if (!Uri.TryCreate(value.Trim(), UriKind.Absolute, out var uri))
+                return null;
+
+            return uri.Scheme == Uri.UriSchemeHttps || uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == "magnet" ? uri : null;
+        }
+
+        // Returns the HTML of each page that answered in time, keyed by Uri.AbsoluteUri.
+        public static IDictionary<string, string> Fetch(WebClient webclient, IList<Uri> urls) =>
+            Fetch(webclient, urls, PageTimeout, TotalBudget, MaxParallel, MinSpacing);
+
+        // Same as above with explicit limits (used by the tests).
+        public static IDictionary<string, string> Fetch(WebClient webclient, IList<Uri> urls, TimeSpan pageTimeout,
+                                                        TimeSpan totalBudget, int maxParallel, TimeSpan minSpacing)
+        {
+            var results = new ConcurrentDictionary<string, string>();
+            var distinct = urls.Where(u => u != null).Select(u => u.AbsoluteUri).Distinct().ToList();
+            if (distinct.Count == 0)
+                return results;
+
+            var cts = new CancellationTokenSource(totalBudget);
+            var gate = new SemaphoreSlim(maxParallel);
+            var spacingLock = new SemaphoreSlim(1, 1);
+            var nextStart = DateTime.UtcNow;
+
+            async Task FetchOne(string url)
+            {
+                try
+                {
+                    await gate.WaitAsync(cts.Token).ConfigureAwait(false);
+                    try
+                    {
+                        await spacingLock.WaitAsync(cts.Token).ConfigureAwait(false);
+                        try
+                        {
+                            var wait = nextStart - DateTime.UtcNow;
+                            if (wait > TimeSpan.Zero)
+                                await Task.Delay(wait, cts.Token).ConfigureAwait(false);
+                            nextStart = DateTime.UtcNow + minSpacing;
+                        }
+                        finally
+                        {
+                            spacingLock.Release();
+                        }
+
+                        var request = webclient.GetResultAsync(new WebRequest(url));
+                        var finished = await Task.WhenAny(request, Task.Delay(pageTimeout, cts.Token)).ConfigureAwait(false);
+                        if (finished == request && request.Status == TaskStatus.RanToCompletion)
+                        {
+                            var html = request.Result?.ContentString;
+                            if (!string.IsNullOrEmpty(html))
+                                results[url] = html;
+                        }
+                        else
+                        {
+                            // abandoned request: observe a late failure so it is not reported as unobserved
+                            _ = request.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                        }
+                    }
+                    finally
+                    {
+                        gate.Release();
+                    }
+                }
+                catch (Exception)
+                {
+                    // cancelled by the total budget or a failed page: skip only this page
+                }
+            }
+
+            var tasks = distinct.Select(FetchOne).ToArray();
+            try
+            {
+                Task.WaitAll(tasks, totalBudget + TimeSpan.FromSeconds(2));
+            }
+            catch (Exception)
+            {
+                // FetchOne swallows its own errors; nothing to do here
+            }
+
+            cts.Cancel();
+            return new Dictionary<string, string>(results);
+        }
+
+        // A post can list several sizes in one field (one per version). ParseUtil.GetBytes would glue
+        // all the digits together and return an absurd number, so read each size separately.
+        public static List<long> ParseSizes(string text)
+        {
+            var sizes = new List<long>();
+            if (string.IsNullOrWhiteSpace(text))
+                return sizes;
+
+            foreach (Match m in Regex.Matches(text, @"(\d+(?:[.,]\d+)?)\s*(TB|GB|MB|KB)", RegexOptions.IgnoreCase))
+            {
+                var bytes = RowParsingExtensions.GetBytes(m.Value);
+                if (bytes > 0 && bytes < 2L * 1024 * 1024 * 1024 * 1024)
+                    sizes.Add(bytes);
+            }
+
+            return sizes;
         }
     }
 }

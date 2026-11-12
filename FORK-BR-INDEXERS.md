@@ -4,11 +4,11 @@ This is an **unofficial fork** of [Jackett](https://github.com/Jackett/Jackett).
 
 ## What is different
 
-The branch `br-indexers` is the upstream tag `v0.24.2830` plus three files in `src/Jackett.Common/Indexers/Definitions/`:
+The branch `br-indexers` is the upstream tag `v0.24.2830` plus three files in `src/Jackett.Common/Indexers/Definitions/` (and, since br2, their tests in `src/Jackett.Test/Common/Indexers/BrazilianDetailPagesTests.cs`):
 
 | File | What it does |
 |---|---|
-| `ApacheTorrent.cs` | Indexer for apachetorrents.com. Broken in upstream `v0.24.2830` (see the issue below) and no longer present in upstream `v0.24.2887`. |
+| `ApacheTorrent.cs` | Indexer for apachetorrents.com. Broken in upstream `v0.24.2830` (see the issue below) and no longer present in upstream `v0.24.2887`. Also holds `BrazilianDetailPages`, the detail page download and size reading shared by the three indexers (since br2). |
 | `RedeTorrent.cs` | Indexer for redestorrents.com. Broken in upstream `v0.24.2830` and no longer present in upstream `v0.24.2887`. |
 | `HDRTorrent.cs` | Upstream indexer for hdrtorrents.net, with the detail page timeout described below. |
 
@@ -16,7 +16,9 @@ Changes over the upstream versions of these indexers:
 
 - ApacheTorrent and RedeTorrent: parsers rewritten for the current layout of the sites (title, quality, audio language, size, publish date, one result per magnet link).
 - A slow or broken detail page no longer kills the whole search. Each detail page has a 15 second limit and, if it fails, only that result is skipped. Before this, one stuck page made the whole search fail after almost three minutes.
-- File size: several sizes in one field are read one by one (they used to be glued into an absurd number), and the fallback estimate understands `1080P`, `4K` and `ULTRA HD`.
+- Detail pages are downloaded up to 3 at a time (new requests still start at least 0.5 s apart, the same rate as before on a fast site), and all detail pages of one search share a 70 second budget. A slow site no longer adds up 15 seconds per result, so a search answers before the 100 second limit of Jackett, Prowlarr, Radarr and Sonarr. Pages that miss the budget are skipped, the rest is returned. (br2)
+- A malformed link (relative detail URL, broken magnet) skips that result instead of failing the whole search. (br2)
+- File size: several sizes in one field are read one by one (they used to be glued into an absurd number), and the fallback estimate understands `1080P`, `4K` and `ULTRA HD`. HDRTorrent uses the same size reading since br2.
 - `WEB` is no longer turned into `WEB-DL-DL` when the site already says `WEB-DL`.
 
 The upstream issues these changes relate to are [#17066](https://github.com/Jackett/Jackett/issues/17066) (ApacheTorrent), [#17096](https://github.com/Jackett/Jackett/issues/17096) (HDRTorrent) and [#17097](https://github.com/Jackett/Jackett/issues/17097) (RedeTorrent).

@@ -100,26 +100,6 @@ namespace Jackett.Common.Indexers.Definitions
             return fileInfo;
         }
 
-        // A single slow or broken detail page must not kill the whole search.
-        // Wait at most DetailTimeout per page and skip that row if it fails or times out.
-        private static readonly TimeSpan DetailTimeout = TimeSpan.FromSeconds(15);
-
-        private string GetDetailPageOrNull(Uri detailUrl)
-        {
-            try
-            {
-                var task = _webclient.GetResultAsync(new WebRequest(detailUrl.ToString()));
-                if (!task.Wait(DetailTimeout))
-                    return null;
-
-                return task.Result?.ContentString;
-            }
-            catch (Exception)
-            {
-                return null;
-            }
-        }
-
         public override IList<ReleaseInfo> ParseResponse(IndexerResponse indexerResponse)
         {
             var releases = new List<ReleaseInfo>();
@@ -127,6 +107,8 @@ namespace Jackett.Common.Indexers.Definitions
             var dom = parser.ParseDocument(indexerResponse.Content);
             var rows = dom.QuerySelectorAll("div.col");
 
+            // First collect every card, then download all detail pages together (see BrazilianDetailPages).
+            var cards = new List<ReleaseInfo>();
             foreach (var row in rows)
             {
                 var h2Anchor = row.QuerySelector("a.media-card-link");
@@ -138,7 +120,9 @@ namespace Jackett.Common.Indexers.Definitions
                 if (string.IsNullOrEmpty(detailUrlStr))
                     continue;
 
-                var detailUrl = new Uri(detailUrlStr);
+                var detailUrl = BrazilianDetailPages.TryAbsoluteUri(detailUrlStr);
+                if (detailUrl == null)
+                    continue;
 
                 var releaseCommonInfo = new ReleaseInfo
                 {
@@ -147,9 +131,14 @@ namespace Jackett.Common.Indexers.Definitions
                     Guid = detailUrl,
                     Seeders = 1
                 };
+                cards.Add(releaseCommonInfo);
+            }
 
-                var detailsHtml = GetDetailPageOrNull(detailUrl);
-                if (string.IsNullOrEmpty(detailsHtml))
+            var detailPages = BrazilianDetailPages.Fetch(_webclient, cards.Select(c => c.Details).ToList());
+
+            foreach (var releaseCommonInfo in cards)
+            {
+                if (!detailPages.TryGetValue(releaseCommonInfo.Details.AbsoluteUri, out var detailsHtml))
                     continue;
 
                 var detailsDom = parser.ParseDocument(detailsHtml);
@@ -167,15 +156,21 @@ namespace Jackett.Common.Indexers.Definitions
                     releaseCommonInfo.PublishDate = DateTime.Today;
                 }
 
-                var magnetLinks = detailsDom.QuerySelectorAll("a[href^='magnet:?']");
-                foreach (var magnetLink in magnetLinks)
+                var magnetLinks = detailsDom.QuerySelectorAll("a[href^='magnet:?']").ToArray();
+                var sizes = BrazilianDetailPages.ParseSizes(fileInfo.Size);
+                for (var idx = 0; idx < magnetLinks.Length; idx++)
                 {
+                    var magnetLink = magnetLinks[idx];
                     var magnet = magnetLink.GetAttribute("href");
                     if (string.IsNullOrEmpty(magnet))
                         continue;
 
+                    var magnetUri = BrazilianDetailPages.TryAbsoluteUri(magnet);
+                    if (magnetUri == null)
+                        continue;
+
                     var release = releaseCommonInfo.Clone() as ReleaseInfo;
-                    release.Guid = release.MagnetUri = new Uri(magnet);
+                    release.Guid = release.MagnetUri = magnetUri;
 
                     var parentText = magnetLink.ParentElement?.TextContent?.Trim();
                     if (!string.IsNullOrEmpty(parentText))
@@ -205,8 +200,11 @@ namespace Jackett.Common.Indexers.Definitions
                         release.Title = $"{release.Title} {resolution}".Trim();
 
                     release.Category = magnetLink.ExtractCategory(release.Title);
-                    var size = RowParsingExtensions.GetBytes(fileInfo.Size ?? string.Empty);
-                    release.Size = size > 0 ? size : ExtractSizeByResolution(release.Title);
+                    // A field with several sizes used to be glued into one absurd number. Use one size per
+                    // magnet when the counts match, a single size for every magnet, otherwise estimate.
+                    release.Size = sizes.Count == magnetLinks.Length ? sizes[idx]
+                                 : sizes.Count == 1 ? sizes[0]
+                                 : ExtractSizeByResolution(release.Title);
 
                     release.DownloadVolumeFactor = 0;
                     release.UploadVolumeFactor = 1;
